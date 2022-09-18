@@ -6,28 +6,50 @@ import me.jonasjones.mcwebserver.util.VerboseLogger;
 
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.Date;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.time.Instant;
 import java.util.StringTokenizer;
 
 public class HTTPServer implements Runnable {
-    static final File WEB_ROOT = new File(ModConfigs.WEB_ROOT);
+    static Path WEB_ROOT;
     static final String DEFAULT_FILE = ModConfigs.WEB_FILE_ROOT;
     static final String FILE_NOT_FOUND = ModConfigs.WEB_FILE_404;
     static final String METHOD_NOT_SUPPORTED = ModConfigs.WEB_FILE_NOSUPPORT;
     // port to listen connection
     static final int PORT = ModConfigs.WEB_PORT;
 
+    private static final byte[] NOT_IMPLEMENTED = "HTTP/1.1 405 Method Not Allowed\r\n".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] OK = "HTTP/1.1 200 OK\r\n".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] NOT_FOUND = "HTTP/1.1 404 Not Found\r\n".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] HEADERS = String.join(
+            "\r\n",
+            "Server: Java HTTP Server from SSaurel : 1.0",
+            "X-Frame-Options: DENY",
+            "X-Content-Type-Options: nosniff",
+            "" // trailing CRLF
+    ).getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CRLF = new byte[]{0x0D, 0x0A};
+
     // Client Connection via Socket Class
-    private Socket connect;
+    private final Socket connect;
+
+    static {
+        try {
+            WEB_ROOT = Path.of(ModConfigs.WEB_ROOT).toRealPath(LinkOption.NOFOLLOW_LINKS);
+        } catch (IOException e) {
+            WEB_ROOT = Path.of(ModConfigs.WEB_ROOT);
+        }
+    }
 
     public HTTPServer(Socket c) {
         connect = c;
@@ -35,23 +57,24 @@ public class HTTPServer implements Runnable {
 
     public static void main() {
         try {
-            ServerSocket serverConnect = new ServerSocket(PORT);
-            McWebserver.LOGGER.info("Server started.");
-            VerboseLogger.info("Listening for connections on port : \" + PORT + \" ...");
+            try (ServerSocket serverConnect = new ServerSocket(PORT)) {
+                McWebserver.LOGGER.info("Server started.");
+                McWebserver.LOGGER.info("Listening for connections on port : " + PORT);
 
-            // we listen until user halts server execution
-            while (true) {
-                HTTPServer myServer = new HTTPServer(serverConnect.accept());
+                // we listen until user halts server execution
+                while (true) {
+                    HTTPServer myServer = new HTTPServer(serverConnect.accept());
 
-                VerboseLogger.info("Connecton opened. (" + new Date() + ")");
+                    VerboseLogger.info("Connection opened. (" + Instant.now() + ")");
 
-                // create dedicated thread to manage the client connection
-                Thread thread = new Thread(myServer);
-                thread.start();
+                    // create dedicated thread to manage the client connection
+                    Thread thread = new Thread(myServer);
+                    thread.start();
+                }
             }
 
         } catch (IOException e) {
-            McWebserver.LOGGER.info("Server Connection error : " + e.getMessage());
+            VerboseLogger.error("Server Connection error : " + e.getMessage());
         }
     }
 
@@ -82,22 +105,21 @@ public class HTTPServer implements Runnable {
                 VerboseLogger.info("501 Not Implemented : " + method + " method.");
 
                 // we return the not supported file to the client
-                File file = new File(WEB_ROOT, METHOD_NOT_SUPPORTED);
-                int fileLength = (int) file.length();
+                Path file = WEB_ROOT.resolve(METHOD_NOT_SUPPORTED);
+                long fileLength = Files.size(file);
                 String contentMimeType = "text/html";
                 //read content to return to client
-                byte[] fileData = readFileData(file, fileLength);
+                byte[] fileData = readFileData(file);
 
                 // we send HTTP Headers with data to client
-                out.println("HTTP/1.1 501 Not Implemented");
-                out.println("Server: Java HTTP Server from SSaurel : 1.0");
-                out.println("Date: " + new Date());
-                out.println("Content-type: " + contentMimeType);
-                out.println("Content-length: " + fileLength);
-                out.println(); // blank line between headers and content, very important !
-                out.flush(); // flush character output stream buffer
+                dataOut.write(NOT_IMPLEMENTED);
+                dataOut.write(HEADERS); //hopefully enough credits
+                dataOut.write("Date: %s\r\n".formatted(Instant.now()).getBytes(StandardCharsets.UTF_8));
+                dataOut.write("Content-Type: %s\r\n".formatted(contentMimeType).getBytes(StandardCharsets.UTF_8));
+                dataOut.write("Content-Length: %s\r\n".formatted(fileLength).getBytes(StandardCharsets.UTF_8));
+                dataOut.write(CRLF); // blank line between headers and content, very important !
                 // file
-                dataOut.write(fileData, 0, fileLength);
+                dataOut.write(fileData, 0, fileData.length);
                 dataOut.flush();
 
             } else {
@@ -105,40 +127,44 @@ public class HTTPServer implements Runnable {
                 if (fileRequested.endsWith("/")) {
                     fileRequested += DEFAULT_FILE;
                 }
+                if (fileRequested.startsWith("/")) {
+                    fileRequested = fileRequested.substring(1);
+                }
 
-                File file = new File(WEB_ROOT, fileRequested);
-                int fileLength = (int) file.length();
-                String content = getContentType(fileRequested);
+                Path file = WEB_ROOT.resolve(fileRequested).toRealPath(LinkOption.NOFOLLOW_LINKS);
+                if (!file.startsWith(WEB_ROOT)) {
+                    VerboseLogger.warn("Access to file outside root: " + file);
+                    throw new NoSuchFileException(fileRequested);
+                }
+                int fileLength = (int)Files.size(file);
+                String contentType = getContentType(fileRequested);
+                byte[] fileData = readFileData(file);
 
+                // send HTTP Headers
+                dataOut.write(OK);
+                dataOut.write(HEADERS);
+                dataOut.write("Date: %s\r\n".formatted(Instant.now()).getBytes(StandardCharsets.UTF_8));
+                dataOut.write("Content-Type: %s\r\n".formatted(contentType).getBytes(StandardCharsets.UTF_8));
+                dataOut.write("Content-Length: %s\r\n".formatted(fileLength).getBytes(StandardCharsets.UTF_8));
+                dataOut.write(CRLF); // blank line between headers and content, very important !
                 if (method.equals("GET")) { // GET method so we return content
-                    byte[] fileData = readFileData(file, fileLength);
-
-                    // send HTTP Headers
-                    out.println("HTTP/1.1 200 OK");
-                    out.println("Server: Java HTTP Server from SSaurel : 1.0");
-                    out.println("Date: " + new Date());
-                    out.println("Content-type: " + content);
-                    out.println("Content-length: " + fileLength);
-                    out.println(); // blank line between headers and content, very important !
-                    out.flush(); // flush character output stream buffer
-
                     dataOut.write(fileData, 0, fileLength);
                     dataOut.flush();
                 }
 
-                VerboseLogger.info("File " + fileRequested + " of type " + content + " returned");
+                VerboseLogger.info("File " + fileRequested + " of type " + contentType + " returned");
 
             }
 
-        } catch (FileNotFoundException fnfe) {
+        } catch (NoSuchFileException e) {
             try {
                 fileNotFound(out, dataOut, fileRequested);
             } catch (IOException ioe) {
-                McWebserver.LOGGER.info("Error with file not found exception : " + ioe.getMessage());
+                VerboseLogger.error("Error with file not found exception : " + ioe.getMessage());
             }
 
         } catch (IOException ioe) {
-            McWebserver.LOGGER.info("Server error : " + ioe);
+            VerboseLogger.error("Server error : " + ioe);
         } finally {
             try {
                 in.close();
@@ -146,7 +172,7 @@ public class HTTPServer implements Runnable {
                 dataOut.close();
                 connect.close(); // we close socket connection
             } catch (Exception e) {
-                McWebserver.LOGGER.info("Error closing stream : " + e.getMessage());
+                VerboseLogger.error("Error closing stream : " + e.getMessage());
             }
 
             VerboseLogger.info("Connection closed.");
@@ -155,19 +181,8 @@ public class HTTPServer implements Runnable {
 
     }
 
-    private byte[] readFileData(File file, int fileLength) throws IOException {
-        FileInputStream fileIn = null;
-        byte[] fileData = new byte[fileLength];
-
-        try {
-            fileIn = new FileInputStream(file);
-            fileIn.read(fileData);
-        } finally {
-            if (fileIn != null)
-                fileIn.close();
-        }
-
-        return fileData;
+    private byte[] readFileData(Path file) throws IOException {
+        return Files.readAllBytes(file);
     }
 
     // return supported MIME Types
@@ -179,22 +194,22 @@ public class HTTPServer implements Runnable {
     }
 
     private void fileNotFound(PrintWriter out, OutputStream dataOut, String fileRequested) throws IOException {
-        File file = new File(WEB_ROOT, FILE_NOT_FOUND);
-        int fileLength = (int) file.length();
-        String content = "text/html";
-        byte[] fileData = readFileData(file, fileLength);
+        Path file = WEB_ROOT.resolve(FILE_NOT_FOUND);
+        int fileLength = (int) Files.size(file);
+        String contentType = "text/html";
+        byte[] fileData = readFileData(file);
 
-        out.println("HTTP/1.1 404 File Not Found");
-        out.println("Server: Java HTTP Server from SSaurel : 1.0");
-        out.println("Date: " + new Date());
-        out.println("Content-type: " + content);
-        out.println("Content-length: " + fileLength);
-        out.println(); // blank line between headers and content, very important !
+        dataOut.write(NOT_FOUND);
+        dataOut.write(HEADERS);
+        dataOut.write("Date: %s\r\n".formatted(Instant.now()).getBytes(StandardCharsets.UTF_8));
+        dataOut.write("Content-Type: %s\r\n".formatted(contentType).getBytes(StandardCharsets.UTF_8));
+        dataOut.write("Content-Length: %s\r\n".formatted(fileLength).getBytes(StandardCharsets.UTF_8));
+        dataOut.write(CRLF); // blank line between headers and content, very important !
         out.flush(); // flush character output stream buffer
 
         dataOut.write(fileData, 0, fileLength);
         dataOut.flush();
 
-        VerboseLogger.info("File " + fileRequested + " not found");
+        VerboseLogger.error("File " + fileRequested + " not found");
     }
 }
