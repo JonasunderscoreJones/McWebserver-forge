@@ -1,3 +1,6 @@
+# Forge port development has ended
+The Fabric/Quilt continues to be supported at the [fabric repository](https://github.com/J-onasJones/McWebserver)
+
 # McWebserver Forge
 A simple webserver that runs alongside the Minecraft Server (Forge version).
 
